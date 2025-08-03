@@ -1,314 +1,183 @@
 const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const path = require('path');
 const fs = require('fs');
+const cors = require('cors');
+const BotRuntime = require('./utils/BotRuntime');
+const { setBotRuntime: setRuntimeForRoutes } = require('./routes/runtime');
+const { setBotRuntime: setRuntimeForWebhooks } = require('./routes/webhooks');
 
 const app = express();
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 3000;
 
-// Middleware оптимизации производительности
-const { apiCacheMiddleware, performanceMiddleware } = require('./utils/OptimizationMiddleware');
+// Инициализация BotRuntime
+const botRuntime = new BotRuntime();
+setRuntimeForRoutes(botRuntime);
+setRuntimeForWebhooks(botRuntime);
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Подключаем middleware оптимизации только для API
-app.use('/api/', performanceMiddleware());
-app.use('/api/', apiCacheMiddleware());
+// Статические файлы
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/frontend', express.static(path.join(__dirname, 'frontend')));
 
-// Полностью отключаем CSP для разработки
-app.use((req, res, next) => {
-  // Удаляем все возможные CSP заголовки
-  res.removeHeader('Content-Security-Policy');
-  res.removeHeader('Content-Security-Policy-Report-Only');
-  res.removeHeader('X-Content-Security-Policy');
-  res.removeHeader('X-WebKit-CSP');
-
-  // Добавляем заголовки для отключения других ограничений безопасности
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  next();
-});
-
-// Настройка MIME типов для ES модулей
-app.use('/assets', (req, res, next) => {
-  if (req.path.endsWith('.js')) {
-    res.setHeader('Content-Type', 'text/javascript');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-  } else if (req.path.endsWith('.mjs')) {
-    res.setHeader('Content-Type', 'text/javascript');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-  } else if (req.path.endsWith('.css')) {
-    res.setHeader('Content-Type', 'text/css');
-  }
-  next();
-});
-
-// Статическая раздача React приложения (приоритет)
-app.use(express.static(path.join(__dirname, 'public', 'dist'), {
-  setHeaders: (res, path) => {
-    if (path.endsWith('.js')) {
-      res.setHeader('Content-Type', 'application/javascript');
-    }
-    if (path.endsWith('.css')) {
-      res.setHeader('Content-Type', 'text/css');
-    }
-    // Отключаем кеширование для разработки
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-  }
-}));
-// Статическая раздача только для совместимости с некоторыми файлами
-// (dashboard.html, deployment.html, logs.html остаются доступными)
-app.use('/data', express.static(path.join(__dirname, 'data')));
-
-// Создание структуры папок для данных
-const createDataDirectories = () => {
-  const directories = [
-    './data',
-    './data/users',
-    './data/bots',
-    './data/templates',
-    './data/logs',
-    './data/visual_schemas'
+// Создание необходимых директорий
+const ensureDirectories = () => {
+  const dirs = [
+    'data',
+    'data/bots',
+    'data/users',
+    'data/sessions',
+    'data/visual_schemas',
+    'data/visual_schemas/versions',
+    'data/templates',
+    'data/backups',
+    'data/logs'
   ];
-
-  directories.forEach(dir => {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-      console.log(`Создана папка: ${dir}`);
+  
+  dirs.forEach(dir => {
+    const dirPath = path.join(__dirname, dir);
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+      console.log(`📁 Создана директория: ${dir}`);
     }
   });
 };
 
-// Middleware для обработки ошибок
-const errorHandler = (err, req, res, next) => {
-  console.error('Ошибка:', err.stack);
+ensureDirectories();
 
-  if (err.type === 'validation') {
-    return res.status(400).json({
-      success: false,
-      error: 'Ошибка валидации данных',
-      details: err.message
-    });
-  }
+// API Routes
+app.use('/api/bots', require('./routes/bots'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/templates', require('./routes/templates'));
+app.use('/api/visual-schemas', require('./routes/visual-schemas'));
+app.use('/api/platforms', require('./routes/platforms'));
+app.use('/api/integrations', require('./routes/integrations'));
+app.use('/api/deployment', require('./routes/deployment-no-auth'));
+app.use('/api/runtime', require('./routes/runtime').router);
 
-  // Убрана обработка ошибок авторизации - авторизация отключена
-  if (false) { // Отключено
-    return res.status(401).json({
-      success: false,
-      error: 'Ошибка авторизации',
-      details: err.message
-    });
-  }
+// Webhook routes
+app.use('/webhook', require('./routes/webhooks').router);
 
-  if (err.type === 'not_found') {
-    return res.status(404).json({
-      success: false,
-      error: 'Ресурс не найден',
-      details: err.message
-    });
-  }
-
-  // Общая ошибка сервера
-  res.status(500).json({
-    success: false,
-    error: 'Внутренняя ошибка сервера',
-    details: process.env.NODE_ENV === 'development' ? err.message : 'Что-то пошло не так'
-  });
-};
-
-// Подключение маршрутов
-// ⚠️ АВТОРИЗАЦИЯ ПОЛНОСТЬЮ ОТКЛЮЧЕНА - НЕ ДОБАВЛЯТЬ!
-const botsRoutes = require('./routes/bots');
-const templatesRoutes = require('./routes/templates');
-const visualSchemasRoutes = require('./routes/visual-schemas');
-const statsRoutes = require('./routes/stats-no-auth');
-
-const deploymentRoutes = require('./routes/deployment-no-auth');
-const { router: webhooksRoutes, setBotRuntime: setWebhookRuntime } = require('./routes/webhooks');
-const { router: runtimeRoutes, setBotRuntime: setRuntimeRuntime } = require('./routes/runtime');
-
-// Инициализация среды выполнения ботов
-const BotRuntime = require('./utils/BotRuntime');
-const botRuntime = new BotRuntime();
-
-// Устанавливаем экземпляр runtime в маршрутах
-setWebhookRuntime(botRuntime);
-setRuntimeRuntime(botRuntime);
-
-// ⚠️ АВТОРИЗАЦИЯ ОТКЛЮЧЕНА - НЕ ДОБАВЛЯТЬ МАРШРУТЫ AUTH!
-app.use('/api/bots', botsRoutes);
-app.use('/api/templates', templatesRoutes);
-app.use('/api/visual-schemas', visualSchemasRoutes);
-app.use('/api/stats', statsRoutes);
-app.use('/api/performance', require('./routes/performance'));
-app.use('/api/canvas-log', require('./routes/canvas-log'));
-// app.use('/api/help', require('./routes/help')); // Отключено
-app.use('/api/logs', require('./routes/logs'));
-app.use('/api/debug', require('./routes/debug'));
-app.use('/api/bots', require('./routes/platforms'));
-app.use('/api/export', require('./routes/export'));
-
-app.use('/api/deployment', deploymentRoutes);
-app.use('/webhook', webhooksRoutes);
-app.use('/api/runtime', runtimeRoutes);
-
-// React приложение уже раздается выше как основное
-
-// Dashboard статистика
-app.get('/api/stats/dashboard', (req, res) => {
-  try {
-    // Получаем список всех ботов
-    const botsDir = path.join(__dirname, 'data', 'bots');
-    let totalBots = 0;
-    let activeBots = 0;
-    let totalMessages = 0;
-    let totalUsers = 0;
-
-    if (fs.existsSync(botsDir)) {
-      const botFiles = fs.readdirSync(botsDir).filter(file => file.endsWith('.json'));
-      totalBots = botFiles.length;
-
-      botFiles.forEach(file => {
-        try {
-          const botData = JSON.parse(fs.readFileSync(path.join(botsDir, file), 'utf8'));
-          if (botData.status === 'active') {
-            activeBots++;
-          }
-          if (botData.stats) {
-            totalMessages += botData.stats.messagesProcessed || 0;
-            totalUsers += botData.stats.activeUsers || 0;
-          }
-        } catch (error) {
-          console.error(`Ошибка чтения бота ${file}:`, error);
-        }
-      });
-    }
-
-    res.json({
-      totalBots,
-      activeBots,
-      totalMessages,
-      totalUsers
-    });
-  } catch (error) {
-    console.error('Ошибка получения статистики dashboard:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Внутренняя ошибка сервера'
-    });
-  }
+// Главная страница - редирект на дашборд
+app.get('/', (req, res) => {
+  res.redirect('/dashboard');
 });
 
-// API health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Bot Constructor API работает',
-    timestamp: new Date().toISOString(),
-    version: '1.0.0'
-  });
-});
-
-// Подключение middleware для обработки ошибок (только для API)
-app.use('/api/*', errorHandler);
-
-// Специальные маршруты для отладки
-app.get('/debug.html', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'dist', 'debug.html'));
-});
-
-// API для логирования отладочной информации
-app.post('/api/debug-log', (req, res) => {
-  const debugInfo = req.body;
-  const logEntry = `=== DEBUG LOG ${debugInfo.timestamp} ===
-Bot Name: ${debugInfo.botName}
-Bot ID (URL): ${debugInfo.botIdFromUrl}
-Bot ID (Data): ${debugInfo.botIdFromData}
-Config Nodes: ${debugInfo.configNodes}
-Config Connections: ${debugInfo.configConnections}
-Config Edges: ${debugInfo.configEdges}
-Legacy Format: ${debugInfo.isLegacy}
-Use New Format: ${debugInfo.useNewFormat}
-=====================================
-
-`;
-  
-  // Перезаписываем файл debug.log (не добавляем)
-  require('fs').writeFileSync(path.join(__dirname, 'debug.log'), logEntry);
-  
-  res.json({ success: true });
-});
-
-// Специальные маршруты для системных страниц (dashboard, deployment, logs)
-app.get('/dashboard.html', (req, res) => {
+// Дашборд
+app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
-app.get('/deployment.html', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'deployment.html'));
+// Редактор ботов
+app.get('/editor', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'editor.html'));
 });
 
-app.get('/logs.html', (req, res) => {
+// Визуальный редактор
+app.get('/visual-editor', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'visual-editor.html'));
+});
+
+// Страница настроек
+app.get('/settings', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'settings.html'));
+});
+
+// Страница логов
+app.get('/logs', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'logs.html'));
 });
 
-// Главный маршрут - React приложение
-app.get('*', (req, res) => {
-  // Исключаем API маршруты и статические файлы
-  if (req.path.startsWith('/api/') ||
-    req.path.startsWith('/assets/') ||
-    req.path.includes('.')) {
-    return res.status(404).send('Not found');
-  }
+// Страница развертывания
+app.get('/deployment', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'deployment.html'));
+});
 
-  // Отправляем React приложение
-  res.sendFile(path.join(__dirname, 'public', 'dist', 'index.html'));
+// Страница интеграций
+app.get('/integrations', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'integrations.html'));
+});
+
+// Страница платформ
+app.get('/platforms', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'platforms.html'));
+});
+
+// API для получения информации о сервере
+app.get('/api/server/info', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      version: '1.1.0',
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      platform: process.platform,
+      nodeVersion: process.version,
+      activeBots: botRuntime.getActiveBots().length,
+      totalRequests: 0 // TODO: добавить счетчик запросов
+    }
+  });
+});
+
+// Обработка ошибок 404
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Страница не найдена'
+  });
+});
+
+// Глобальный обработчик ошибок
+app.use((err, req, res, next) => {
+  console.error('Глобальная ошибка:', err);
+  res.status(500).json({
+    success: false,
+    error: 'Внутренняя ошибка сервера'
+  });
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Получен сигнал SIGINT. Завершение работы...');
+  
+  try {
+    // Останавливаем всех ботов
+    await botRuntime.stopAllBots();
+    console.log('✅ Все боты остановлены');
+    
+    // Закрываем сервер
+    server.close(() => {
+      console.log('✅ HTTP сервер закрыт');
+      process.exit(0);
+    });
+  } catch (error) {
+    console.error('❌ Ошибка при завершении работы:', error);
+    process.exit(1);
+  }
 });
 
 // Запуск сервера
-const startServer = async () => {
-  createDataDirectories();
-
-  app.listen(PORT, async () => {
-    console.log(`🚀 Bot Constructor запущен на порту ${PORT}`);
-    console.log(`📁 Структура данных создана`);
-    console.log(`🌐 Откройте http://localhost:${PORT} в браузере`);
-
-    // Загружаем активных ботов
-    try {
-      const loadedBots = await botRuntime.loadAllBots();
-      console.log(`🤖 Среда выполнения готова (${loadedBots} ботов)`);
-    } catch (error) {
-      console.error('⚠️ Ошибка загрузки ботов:', error.message);
-    }
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📊 Дашборд: http://localhost:${PORT}/dashboard`);
+  console.log(`✏️ Редактор: http://localhost:${PORT}/editor`);
+  console.log(`🎨 Визуальный редактор: http://localhost:${PORT}/visual-editor`);
+  console.log(`⚙️ Настройки: http://localhost:${PORT}/settings`);
+  console.log(`📋 Логи: http://localhost:${PORT}/logs`);
+  console.log(`🚀 Развертывание: http://localhost:${PORT}/deployment`);
+  console.log(`🔗 Интеграции: http://localhost:${PORT}/integrations`);
+  console.log(`📱 Платформы: http://localhost:${PORT}/platforms`);
+  
+  // Автозагрузка ботов при старте
+  botRuntime.autoLoadBots().then(() => {
+    console.log('✅ Автозагрузка ботов завершена');
+  }).catch(error => {
+    console.error('❌ Ошибка автозагрузки ботов:', error);
   });
-};
-
-// React Router - catch-all для SPA
-app.get('*', (req, res) => {
-  // Исключаем API роуты и системные файлы
-  if (req.path.startsWith('/api/') ||
-    req.path.startsWith('/data/') ||
-    req.path.includes('.')) {
-    return res.status(404).json({ error: 'Not found' });
-  }
-
-  // Отправляем React приложение для всех остальных роутов
-  res.sendFile(path.join(__dirname, 'public', 'dist', 'index.html'));
 });
 
-startServer();
-
-// Экспортируем функцию для получения экземпляра BotRuntime
-function getBotRuntime() {
-  return botRuntime;
-}
-
-module.exports = { app, getBotRuntime };
+module.exports = app;
